@@ -2,12 +2,14 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import hashlib
 import uuid
 import glob
 import time
-from dataclasses import dataclass
-
+import argparse
+from dataclasses import dataclass, fields
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -46,6 +48,34 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T
     return X
+
+@torch.compile
+def annotated_zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    singular_values_over_iters = []
+    for i in range(steps):
+        _, S, _ = X.float().svd()
+        singular_values_over_iters.append(S.tolist())
+        A = X @ X.T
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X, singular_values_over_iters
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
@@ -353,7 +383,37 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
+
+    embedding_lr : float = 0.02
+    lm_head_lr : float = 0.002
+    muon_lr : float = 0.02
+    muon_momentum : float = 0.95
+    scalar_lr : float = 0.02
+
+    newton_schulz_iters : int = 10
+    log_singular_values : bool = False
+
+    @classmethod
+    def from_args(cls):
+        parser = argparse.ArgumentParser(description='Train GPT-2 model')
+        for field in fields(cls):
+            field_type = field.type
+            # Handle special case for str since type(str) doesn't work with argparse
+            if field_type == str:
+                field_type = str
+            # Add argument with appropriate type and default value
+            parser.add_argument(
+                f'--{field.name}',
+                type=field_type,
+                default=field.default,
+                help=f'{field.name} (default: {field.default})'
+            )
+        args = parser.parse_args()
+        # Convert namespace to dict and create instance
+        return cls(**vars(args))
+
+# Replace the direct instantiation with the CLI-aware version
+args = Hyperparameters.from_args()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -366,19 +426,34 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
+def get_run_id():
+    code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
+    code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
+    cli_args = ' '.join(sys.argv[1:])  # Skip the script name (sys.argv[0])
+    args_hash = hashlib.md5(cli_args.encode()).hexdigest()[:8]
+    run_id = f"{code_hash}-{args_hash}"
+    return run_id
+
+
+
 # begin logging
 logfile = None
 if master_process:
-    run_id = str(uuid.uuid4())
+    run_id = get_run_id()
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
+    cli_args = ' '.join(sys.argv[1:])  # Skip the script name (sys.argv[0])
+    
     # create the log file
     with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
+        # First line: CLI arguments (or empty line if none)
+        f.write(cli_args + '\n')
+        # Then the usual separator and code
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
+
 def print0(s, logonly=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -438,7 +513,7 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, beta
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=args.newton_schulz_iters)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -494,13 +569,38 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
+        if step >= 500 and val_loss > 4.0:
+            print0(f"Val loss exceeded 4.0 at step {step}, stopping early")
+            break;
+
+        if args.log_singular_values:
+            list_of_singular_value_lists_by_matrix = []
+            for params in matrix_params:
+                _, singular_value_list = annotated_zeropower_via_newtonschulz5(params, steps=args.newton_schulz_iters)
+                list_of_singular_value_lists_by_matrix.append(singular_value_list)
+
+            records_of_singular_value_lists_by_ns_iter = []
+            for newton_schulz_iter in range(args.newton_schulz_iters):
+                singular_values_for_this_iter = []
+                for single_matrix_singular_values_list in list_of_singular_value_lists_by_matrix:
+                    singular_values_for_this_iter += single_matrix_singular_values_list[newton_schulz_iter]
+                singular_values_for_this_iter.sort()
+                records_of_singular_value_lists_by_ns_iter.append({
+                    "newton_schulz_iter": newton_schulz_iter,
+                    "singular_values": singular_values_for_this_iter
+                })
+            singular_values_df = pd.DataFrame(records_of_singular_value_lists_by_ns_iter)
+            singular_values_df.to_csv(f"logs/{get_run_id()}/singular_values_at_step{step}.csv", index=False)
+            
+            
+
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        torch.save(log, f'logs/{get_run_id()}/state_step%06d.pt' % (step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -545,7 +645,8 @@ for step in range(args.num_iterations + 1):
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
 if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    print0(f"Run ID: {get_run_id()}")
 
 # -------------------------------------------------------------------------
 # clean up nice

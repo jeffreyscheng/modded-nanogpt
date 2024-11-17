@@ -50,7 +50,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     return X
 
 @torch.compile
-def annotated_zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def annotated_zeropower_via_newtonschulz5(G, steps=10, eps=1e-12):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -62,13 +62,13 @@ def annotated_zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
+    X = G
+    X = X / (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     singular_values_over_iters = []
     for i in range(steps):
-        _, S, _ = X.float().svd()
+        S = torch.linalg.svdvals(X)
         singular_values_over_iters.append(S.tolist())
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
@@ -146,6 +146,52 @@ class Muon(torch.optim.Optimizer):
             for p in group['params']:
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
                 p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
+
+class StiefelDescent(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                W = p.data
+                skew = W.t() @ g - g.t() @ W
+                skew_zero = zeropower_backend(skew, steps=group['backend_steps'])
+                n = W.size(1)
+                I = torch.eye(n, device=W.device, dtype=W.dtype)
+                denominator = 1 + lr * lr
+                p.data = W @ (I - lr * skew_zero) / denominator
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
@@ -392,6 +438,7 @@ class Hyperparameters:
 
     newton_schulz_iters : int = 10
     log_singular_values : bool = False
+    use_stiefel_descent : bool = False
 
     @classmethod
     def from_args(cls):
@@ -513,7 +560,10 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, beta
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=args.newton_schulz_iters)
+if args.use_stiefel_descent:
+    optimizer3 = StiefelDescent(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=args.newton_schulz_iters)
+else:
+    optimizer3 = Muon(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=args.newton_schulz_iters)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)

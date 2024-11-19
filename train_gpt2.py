@@ -20,6 +20,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+def compute_gram_deviation(matrix):
+    if matrix.size(0) < matrix.size(1):
+        matrix = matrix.T
+    gd = float(torch.norm(matrix.T @ matrix - torch.eye(matrix.size(1)).cuda(), "fro").item())
+    if gd > 15:
+        min_col_norm = torch.min(torch.norm(matrix, dim=0)).item()
+        max_col_norm = torch.max(torch.norm(matrix, dim=0)).item()
+        raise ValueError(f"Gram deviation is too high: {gd}, min_col_norm: {min_col_norm}, max_col_norm: {max_col_norm}")
+    return gd
+
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
@@ -45,6 +55,29 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+@torch.compile
+def zeropower_weights_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        X = X @ (3 * torch.eye(X.size(1), device=X.device, dtype=X.dtype) - X.T @ X) / 2
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -190,8 +223,8 @@ class StiefelDescent(torch.optim.Optimizer):
                 skew_zero = zeropower_backend(skew, steps=group['backend_steps'])
                 n = W.size(1)
                 I = torch.eye(n, device=W.device, dtype=W.dtype)
-                denominator = 1 + lr * lr
-                p.data = W @ (I - lr * skew_zero) / denominator
+                denominator = (1 + lr * lr)**0.5
+                p.data = W @ ((I - lr * skew_zero) / denominator)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
@@ -228,9 +261,28 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
-class CastedLinear(nn.Linear):
+# class CastedLinear(nn.Linear):
+#     def forward(self, x):
+#         return F.linear(x, self.weight.to(x.dtype))
+    
+class ScaledCastedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, scale=1.0, bias=True):
+        super().__init__(in_features, out_features, bias)
+        self.scale = nn.Parameter(torch.tensor(scale))
+        # define self.weight
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        nn.init.orthogonal_(self.weight.data)
+        verify_orthogonality_with_vector_norms(self.weight.data)
+
     def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+        return F.linear(x, self.weight.to(x.dtype)) * self.scale
+
+def verify_orthogonality_with_vector_norms(Q, tol=1e-2):
+    row_norms = torch.norm(Q, dim=1)
+    col_norms = torch.norm(Q, dim=0)
+    is_tall = Q.shape[0] > Q.shape[1]
+    norms = col_norms if is_tall else row_norms
+    assert torch.allclose(norms, torch.ones_like(norms), atol=tol), f"{'Column' if is_tall else 'Row'} norms not ≈ 1: min={norms.min().item():.3f}, max={norms.max().item():.3f}"
 
 class CausalSelfAttention(nn.Module):
 
@@ -240,12 +292,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = ScaledCastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = ScaledCastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = ScaledCastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj = ScaledCastedLinear(self.n_embd, self.n_embd, scale=0.0, bias=False)  # mimick zero init
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
@@ -269,9 +320,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_fc    = ScaledCastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = ScaledCastedLinear(4 * config.n_embd, config.n_embd, scale=0.0, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -314,7 +364,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = ScaledCastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
@@ -439,6 +489,7 @@ class Hyperparameters:
     newton_schulz_iters : int = 10
     log_singular_values : bool = False
     use_stiefel_descent : bool = False
+    orthogonalize_every: int = 10
 
     @classmethod
     def from_args(cls):
@@ -538,7 +589,7 @@ num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
-    if isinstance(m, CastedLinear):
+    if isinstance(m, ScaledCastedLinear):
         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -619,8 +670,8 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-        if step >= 500 and val_loss > 4.0:
-            print0(f"Val loss exceeded 4.0 at step {step}, stopping early")
+        if step >= 500 and val_loss > 4.5:
+            print0(f"Val loss exceeded 4.5 at step {step}, stopping early")
             break;
 
         if args.log_singular_values:
@@ -641,6 +692,26 @@ for step in range(args.num_iterations + 1):
                 })
             singular_values_df = pd.DataFrame(records_of_singular_value_lists_by_ns_iter)
             singular_values_df.to_csv(f"logs/{get_run_id()}/singular_values_at_step{step}.csv", index=False)
+
+    if step % args.orthogonalize_every == 0:
+        with torch.no_grad():
+            gram_deviations = []
+            for params in matrix_params:
+                gram_deviations.append(compute_gram_deviation(params))
+                # Make sure tensor is contiguous before broadcast
+                ortho_weights = zeropower_weights_via_newtonschulz5(params, steps=100).contiguous()
+                # Sync across all ranks
+                torch.distributed.broadcast(ortho_weights, src=0)
+                params.data.copy_(ortho_weights)
+            
+            avg_gram_deviation = sum(gram_deviations) / len(gram_deviations)
+            print0(f"Gram deviation at step {step}: {avg_gram_deviation}")
+        
+        # Make sure all ranks are synced
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
             
             
 

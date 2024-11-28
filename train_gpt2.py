@@ -15,6 +15,34 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# new serialization code
+import pickle 
+
+def serialize_matrix_params(model, filepath):
+    """
+    Fast serialization of matrix parameters using pickle, including parameter names.
+    
+    Args:
+        model: The GPT model (will be unwrapped if DDP)
+        filepath: Path to save the pickle file
+    """
+    # Unwrap DDP if needed
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    # Get all transformer matrix parameters with their names in one pass
+    named_params = [
+        (name.replace('module.', '').replace('transformer.', '').replace('weight', '').strip('.'),
+         param.detach().cpu().numpy(),
+         param.shape)
+        for name, param in model.named_parameters()
+        if param.ndim == 2 and 'transformer.h' in name
+    ]
+    
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'wb') as f:
+        pickle.dump(named_params, f)
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -34,7 +62,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    # a, b, c = (3.4445, -4.7750,  2.0315)
+    a, b, c = (2.37, -2.028, 0.706)
     X = G.bfloat16()
     X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
@@ -342,8 +371,8 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    batch_size : int = 8*32 # batch size, in sequences, across all devices
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
@@ -493,6 +522,11 @@ for step in range(args.num_iterations + 1):
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
+
+        # serialize matrix parameters
+        # matrix_params_path = f'logs/{run_id}/matrix_params_step{step}.pkl'
+        # serialize_matrix_params(model, matrix_params_path)
+
 
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
         # stop the clock

@@ -7,6 +7,8 @@ import time
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
+import argparse
+from dataclasses import fields
 
 import torch
 from torch import nn
@@ -99,8 +101,6 @@ class Muon(torch.optim.Optimizer):
     def step(self):
 
         for group in self.param_groups:
-
-            lr = group['lr']
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
@@ -116,9 +116,18 @@ class Muon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
+                    if args.use_prodigy:
+                        g_flat = g_world.view(-1)
+                        w_flat = p_world.data.view(-1)
+                        # Calculate g^T w_t / ||g_t||_1
+                        prodigy_lr = torch.dot(g_flat, w_flat.bfloat16()) / (torch.norm(g_flat, p=1) + 1e-8)
+                        if prodigy_lr > group["lr"]:
+                            group["lr"] = prodigy_lr 
+                            print0(f"Prodigy LR: {prodigy_lr}")
+
                     p_world.data.add_(
                         g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
+                        alpha=-group["lr"] * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
             for base_i in range(len(params))[::self.world_size]:
                 p = params[base_i + self.rank]
@@ -428,6 +437,34 @@ class Hyperparameters:
     log_singular_values : bool = False
     newton_schulz_iters : int = 5
     serialize_checkpoints: bool = False    
+    use_prodigy: bool = True
+
+    def __post_init__(self):
+        # Parse command line arguments and override defaults
+        parser = argparse.ArgumentParser(description='Training script for GPT model')
+        
+        # Add arguments for each field in the dataclass
+        for field in fields(self):
+            field_type = field.type
+            # Handle special case for bool flags
+            if field_type == bool:
+                parser.add_argument(f'--{field.name}', action='store_true', 
+                                  help=f'Enable {field.name}')
+                parser.add_argument(f'--no-{field.name}', action='store_false',
+                                  dest=field.name, help=f'Disable {field.name}')
+            else:
+                parser.add_argument(f'--{field.name}', type=field_type, 
+                                  help=f'Set {field.name} (default: {getattr(self, field.name)})')
+
+        # Parse args and update fields
+        args = parser.parse_args()
+        
+        # Only override values that were explicitly set on command line
+        for arg_name, arg_value in vars(args).items():
+            if arg_value is not None:
+                setattr(self, arg_name, arg_value)
+
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -511,7 +548,9 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 
 params = list(raw_model.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+# optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=1e-2, momentum=0.95)
+print("TESTING ARGS", args.muon_lr, args.warmup_iters, args.cooldown_iters)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
@@ -527,7 +566,20 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
+
+def get_lr_mult(it):
+    if it == 0:
+        return get_lr(0)  
+
+    if it < args.warmup_iters:
+        return (it+1) / it
+    elif it < args.num_iterations - args.cooldown_iters:
+        return 1.0
+    else:
+        return (args.num_iterations - it) / (args.num_iterations - it + 1)
+    
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+schedulers[2] = torch.optim.lr_scheduler.MultiplicativeLR(optimizer3, get_lr_mult)
 
 sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
 sw_num_blocks_prev = 1
@@ -614,7 +666,6 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    print0("got here 2")
     for i in range(1, train_accumulation_steps + 1):
         with contextlib.ExitStack() as stack:
             if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
@@ -647,16 +698,3 @@ wandb.finish()
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
-
-
-# UNCOMMENT TO RUN SWEEP
-# if __name__ == "__main__":
-#     if ddp_rank == 0:  # Only create sweep on master process
-#         sweep_configuration = {
-#             'method': 'grid',
-#             'parameters': {
-#                 'muon_lr': {'values': [0.01, 0.02]}
-#             }
-#         }
-#         sweep_id = wandb.sweep(sweep_configuration, project="nanogpt")
-#         wandb.agent(sweep_id, function=lambda: None, count=5)

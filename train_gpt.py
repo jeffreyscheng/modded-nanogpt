@@ -5,10 +5,12 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
-import glob
+import numpy as np
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import pickle
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -19,6 +21,35 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+
+from research_experimentation_utils.serialization_utils import serialize_matrix_params
+
+# -----------------------------------------------------------------------------
+# Matrix logging functions
+
+def should_log_matrices(step: int, total_steps: int) -> bool:
+    """Determine if we should log matrices at this step.
+    
+    Starts with logging every step, gradually decreases to logging every ~200 steps
+    by the end of training.
+    
+    Args:
+        step: Current training step
+        total_steps: Total number of training steps
+        
+    Returns:
+        Boolean indicating whether to log matrices
+    """
+    if step == 0 or step == total_steps:
+        return True
+        
+    # Progress through training (0 to 1)
+    progress = step / total_steps
+    
+    # Exponentially increasing interval (1 at start, ~200 at end)
+    log_interval = max(1, int(np.exp(progress * np.log(200))))
+    
+    return step % log_interval == 0
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -116,7 +147,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -124,11 +154,17 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
-    for _ in range(steps):
+    for a, b, c in [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]:
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -155,10 +191,10 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -180,6 +216,7 @@ class Muon(torch.optim.Optimizer):
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.mul_(1 - group["lr"] * group["weight_decay"])
                     p_world.add_(g_world.view_as(p_world),
                                  alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
             for base_i in range(len(params))[::self.world_size]:
@@ -209,7 +246,7 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
         self.x_s = x_s
@@ -264,6 +301,9 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -275,9 +315,7 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -327,8 +365,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
-                                    use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=0.5, w_s=2**-9, grad_s=2**-19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -383,7 +420,7 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -399,10 +436,10 @@ class GPT(nn.Module):
                 skip_connections.append(x)
 
         x = norm(x)
-        logits = self.lm_head(x).float()
+        logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
 
 # -----------------------------------------------------------------------------
@@ -421,7 +458,7 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
@@ -444,11 +481,11 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
+    train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1770 # number of iterations to run
-    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    num_iterations = 6950 # number of iterations to run
+    cooldown_frac = 0.6 # fraction of training spent cooling down the learning rate - increased by @YouJiacheng
     # architecture
     vocab_size = 50257
     # evaluation and logging
@@ -497,7 +534,7 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
+model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
@@ -512,11 +549,11 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=head_params, lr=0.1/1024**0.5), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -529,8 +566,7 @@ def get_lr(step: int):
     if x < 1 - args.cooldown_frac:
         return 1.0
     else:
-        w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
+        return (1 - x) / args.cooldown_frac
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -628,6 +664,30 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+
+    # --------------- SINGULAR VALUES SECTION -----------------
+    if master_process and should_log_matrices(step, train_steps):
+        # Get all named parameters from the model that have gradients and are 2D matrices
+        # We need to get parameters from the non-compiled model if possible
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        
+        # Create a dictionary of parameter names to gradient matrices
+        matrices_dict = {}
+        for name, param in raw_model.named_parameters():
+            if param.grad is not None and param.ndim == 2:
+                matrices_dict[name] = param.grad.detach().clone()
+        
+        # Ensure the matrices directory exists
+        os.makedirs(f"matrices/{run_id}", exist_ok=True)
+        
+        try:
+            # Save the gradient matrices directly as a dictionary
+            with open(f"matrices/{run_id}/step{step}.pkl", "wb") as f:
+                pickle.dump(matrices_dict, f)
+            print0(f"Logged gradient matrices at step {step}", console=True)
+        except Exception as e:
+            print0(f"Error logging gradient matrices at step {step}: {e}", console=True)
+    
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging

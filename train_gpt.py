@@ -25,34 +25,34 @@ torch._inductor.config.coordinate_descent_tuning = True # we have banned this fl
 # -----------------------------------------------------------------------------
 # jeffrey's logs
 
-# def should_log_matrices(step: int, total_steps: int) -> bool:
-#     """Determine if we should log matrices at this step.
+def should_log_matrices(step: int, total_steps: int) -> bool:
+    """Determine if we should log matrices at this step.
     
-#     Starts with logging every step, rapidly decreases so that by step 25
-#     we're no longer logging every minibatch, and gradually approaches 
-#     logging every ~200 steps by the end of training.
+    Starts with logging every step, rapidly decreases so that by step 25
+    we're no longer logging every minibatch, and gradually approaches 
+    logging every ~200 steps by the end of training.
     
-#     Args:
-#         step: Current training step
-#         total_steps: Total number of training steps
+    Args:
+        step: Current training step
+        total_steps: Total number of training steps
         
-#     Returns:
-#         Boolean indicating whether to log matrices
-#     """
-#     if step == 0 or step == total_steps:
-#         return True
+    Returns:
+        Boolean indicating whether to log matrices
+    """
+    if step == 0 or step == total_steps:
+        return True
         
-#     # Early rapid falloff followed by more gradual increase to final interval
-#     if step < 25:
-#         # More aggressive early falloff (quadratic growth)
-#         log_interval = max(1, int((step / 25) ** 2 * 10) + 1)
-#     else:
-#         # Progress through remaining training (0 to 1)
-#         remaining_progress = (step - 25) / (total_steps - 25)
-#         # Start at interval ~10 and grow to ~200
-#         log_interval = max(10, int(10 + remaining_progress * 190))
+    # Early rapid falloff followed by more gradual increase to final interval
+    if step < 25:
+        # More aggressive early falloff (quadratic growth)
+        log_interval = max(1, int((step / 25) ** 2 * 10) + 1)
+    else:
+        # Progress through remaining training (0 to 1)
+        remaining_progress = (step - 25) / (total_steps - 25)
+        # Start at interval ~10 and grow to ~200
+        log_interval = max(10, int(10 + remaining_progress * 190))
     
-#     return step % log_interval == 0
+    return step % log_interval == 0
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -139,8 +139,21 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # Muon optimizer
 
 def zeropower_factory(poly_coeffs):
+    """
+    Factory function that returns a function that computes the zero power of a matrix
+    using Newton-Schulz iteration.
+
+    Args:
+        poly_coeffs: Coefficients for each iteration, either as:
+           - List of coefficient tuples (a, b, c)
+           - Tensor of shape [num_iterations, 3]
+           - Binary representation of bfloat16 values [[uint16, uint16, uint16], ...]
+    """
+    current_device = torch.cuda.current_device()
+    coeffs_tensor = torch.tensor(poly_coeffs, dtype=torch.float32, device=current_device)
+    
     @torch.compile
-    def zeropower_via_newtonschulz(G: Tensor) -> Tensor:
+    def zeropower_via_newtonschulz(G):
         """
         Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
         quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -151,14 +164,16 @@ def zeropower_factory(poly_coeffs):
         performance at all relative to UV^T, where USV^T = G is the SVD.
         """
         assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-        X = G.bfloat16()
+        X = G.float()
         if G.size(-2) > G.size(-1):
             X = X.mT
 
         # Ensure spectral norm is at most 1
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-5)
+        # 0.99 is there because next(1.00) in bfloat16 is 1.0078125
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-5) * 0.99
         # Perform the NS iterations
-        for a, b, c in poly_coeffs:
+        for i in range(coeffs_tensor.size(0)):
+            a, b, c = coeffs_tensor[i]
             A = X @ X.mT
             B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
             X = a * X + B @ X
@@ -166,6 +181,7 @@ def zeropower_factory(poly_coeffs):
         if G.size(-2) > G.size(-1):
             X = X.mT
         return X
+    
     return zeropower_via_newtonschulz
 
 class Muon(torch.optim.Optimizer):
@@ -197,7 +213,7 @@ class Muon(torch.optim.Optimizer):
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            b = torch.empty(world_size, size, dtype=torch.float32, device="cuda")
             group = dict(params=[p for p in params if p.numel() == size],
                          update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
             param_groups.append(group)
@@ -220,20 +236,20 @@ class Muon(torch.optim.Optimizer):
             ]
         )
 
-        self.zeropower7 = zeropower_factory(
-            [
-                [4.510918617248535, -7.218330383300781, 2.7313356399536133],
-                [4.605247974395752, -6.573604106903076, 2.3541903495788574],
-                [4.919572353363037, -5.963148593902588, 1.814536452293396],
-                [4.132555961608887, -3.550161123275757, 0.7916041016578674],
-                [3.9480252265930176, -3.3081469535827637, 0.7301044464111328],
-                [2.495997905731201, -1.7606257200241089, 0.3820432126522064],
-                [2.0578646659851074, -1.5518815517425537, 0.48931562900543213],
-            ]
-        )
+        # These are the optimal bfloat16 coefficients we found
+        # Represented in decimal form for readability
+        self.zeropower7 = zeropower_factory([
+            [4.5, -7.21875, 2.734375],
+            [4.59375, -6.5625, 2.359375],
+            [4.90625, -5.9375, 1.8125],
+            [4.125, -3.5625, 0.7890625],
+            [3.9375, -3.296875, 0.7265625],
+            [2.484375, -1.7578125, 0.3828125],
+            [2.0625, -1.5546875, 0.490234375],
+        ])
         
         # Default to zeropower5 at initialization
-        self.zeropower = self.zeropower7
+        self.zeropower = self.zeropower5
         self.training_progress = 0.0
 
         super().__init__(param_groups, defaults)
@@ -317,24 +333,24 @@ class CastedLinear(nn.Linear):
         else:
             return F.linear(x, self.weight.type_as(x))
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
-        super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
+# class Rotary(nn.Module):
+#     def __init__(self, dim: int, max_seq_len: int):
+#         super().__init__()
+#         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+#         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+#         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+#         t = torch.arange(max_seq_len, dtype=torch.float32)
+#         theta = torch.einsum("i,j -> ij", t, angular_freq)
+#         self.cos = nn.Buffer(theta.cos(), persistent=False)
+#         self.sin = nn.Buffer(theta.sin(), persistent=False)
 
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+#     def forward(self, x_BTHD: Tensor):
+#         assert self.cos.size(0) >= x_BTHD.size(-3)
+#         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+#         x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+#         y1 = x1 * cos + x2 * sin
+#         y2 = x1 * (-sin) + x2 * cos
+#         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
@@ -348,7 +364,7 @@ class CausalSelfAttention(nn.Module):
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(head_dim, max_seq_len)
+        # self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
@@ -360,7 +376,7 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
+        # q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
@@ -752,30 +768,51 @@ for step in range(train_steps + 1):
             work.wait()
         opt.step()
     
-    # --------------- SINGULAR VALUES SECTION -----------------
-    # if master_process and should_log_matrices(step, train_steps):
-    #     # Get all named parameters from the model that have gradients and are 2D matrices
-    #     # We need to get parameters from the non-compiled model if possible
-    #     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    # --------------- GRADIENT LOGGING SECTION -----------------
+    if master_process and should_log_matrices(step, train_steps):
+        # Get all named parameters from the model that have gradients and are 2D matrices
+        # We need to get parameters from the non-compiled model if possible
         
-    #     # Create a list of tuples (name, matrix, shape) for each parameter with gradients
-    #     matrices_list = []
-    #     for name, param in raw_model.named_parameters():
-    #         if param.grad is not None and param.ndim == 2:
-    #             # Convert to float32 before going to numpy to handle BFloat16 tensors
-    #             matrix = param.grad.detach().clone().cpu().to(torch.float32).numpy()
-    #             matrices_list.append((name, matrix, matrix.shape))
+        # Create a list of tuples (name, matrix, shape) for each parameter with gradients
+        matrices_list = []
+        for name, param in model.named_parameters():
+            if param.grad is not None and param.ndim == 2:
+                # Calculate the accumulated gradient based on which optimizer is used
+                accumulated_grad = param.grad.detach().clone()
+                
+                # Find which optimizer this parameter belongs to
+                for opt in optimizers:
+                    if any(id(param) == id(p) for p in opt_params(opt)):
+                        # For Muon optimizer
+                        if isinstance(opt, Muon):
+                            state = opt.state[param]
+                            if "momentum_buffer" in state:
+                                buf = state["momentum_buffer"]
+                                if opt.param_groups[0]["nesterov"]:
+                                    accumulated_grad = accumulated_grad.lerp(buf, opt.param_groups[0]["momentum"])
+                                else:
+                                    accumulated_grad = buf.clone()
+                        # For Adam optimizer
+                        elif isinstance(opt, torch.optim.Adam):
+                            state = opt.state[param]
+                            if len(state) > 0 and "exp_avg" in state:
+                                accumulated_grad = state["exp_avg"].clone()
+                        break
+                
+                # Convert to float32 before going to numpy to handle BFloat16 tensors
+                matrix = accumulated_grad.cpu().to(torch.float32).numpy()
+                matrices_list.append((name, matrix, matrix.shape))
         
-    #     # Ensure the matrices directory exists
-    #     os.makedirs(f"matrices/{run_id}", exist_ok=True)
+        # Ensure the matrices directory exists
+        os.makedirs(f"matrices/{run_id}", exist_ok=True)
         
-    #     try:
-    #         # Save the gradient matrices as a list of tuples
-    #         with open(f"matrices/{run_id}/step{step}.pkl", "wb") as f:
-    #             pickle.dump(matrices_list, f)
-    #         print0(f"Logged gradient matrices at step {step}", console=True)
-    #     except Exception as e:
-    #         print0(f"Error logging gradient matrices at step {step}: {e}", console=True)
+        try:
+            # Save the accumulated gradient matrices as a list of tuples
+            with open(f"matrices/{run_id}/step{step}.pkl", "wb") as f:
+                pickle.dump(matrices_list, f)
+            print0(f"Logged accumulated gradient matrices at step {step}", console=True)
+        except Exception as e:
+            print0(f"Error logging accumulated gradient matrices at step {step}: {e}", console=True)
 
     # null the gradients
     model.zero_grad(set_to_none=True)

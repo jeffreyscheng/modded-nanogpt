@@ -18,6 +18,59 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 from torch import Tensor
 
+# Function to round mantissa bits to simulate specific precision
+def round_to_precision(param, bits):
+    """
+    Properly simulates reduced precision floating point by rounding mantissa bits.
+    
+    Float32 has: 1 sign bit + 8 exponent bits + 23 mantissa bits
+    BFloat16 has: 1 sign bit + 8 exponent bits + 7 mantissa bits
+    
+    So we need to round 16 bits going from float32 to bfloat16.
+    
+    Args:
+        param: A float32 tensor
+        bits: Target bits of precision (32 to 16)
+    
+    Returns:
+        A float32 tensor with reduced precision
+    """
+    if bits >= 32:
+        return param  # No reduction needed
+    
+    # Calculate how many mantissa bits to keep (23 for float32, less for lower precision)
+    mantissa_bits_to_keep = max(bits - 9, 0)  # 9 bits for sign+exponent
+    bits_to_round = 23 - mantissa_bits_to_keep
+    
+    if bits_to_round <= 0:
+        return param
+    
+    # Create a rounding bit at the position we're cutting off
+    rounding_bit = 1 << (bits_to_round - 1)
+    # Create a mask for the bits we want to keep
+    mask = (-1) << bits_to_round
+    
+    # Cast to int to perform bit manipulation
+    as_int = param.view(torch.int32)
+    
+    # Add rounding bit (adds 0.5 to the last bit being kept)
+    rounded_int = as_int + rounding_bit
+    
+    # Apply mask to clear lower bits
+    rounded_int = rounded_int & mask
+    
+    return rounded_int.view(torch.float32)
+
+# Hook to maintain quantization level during gradient updates
+class RoundingHook:
+    def __init__(self, bits):
+        self.bits = bits
+        
+    def __call__(self, grad):
+        if grad is None:
+            return None
+        return round_to_precision(grad, self.bits)
+
 @torch.compile
 def zeropower_via_newtonschulz5(G, coefficients) -> Tensor:
     """
@@ -48,17 +101,14 @@ def zeropower_via_newtonschulz5(G, coefficients) -> Tensor:
     return X
 
 class GeneralizedNewtonSchulz(nn.Module):
-    def __init__(self, init_coefficients: List[float] = None, scaling_factor: float = 32.0):
+    def __init__(self, init_coefficients: List[float] = None):
         super().__init__()
         # Create parameters with explicit dtype to ensure they require gradients
         self.poly_layers = nn.ParameterList([
-            nn.Parameter(torch.tensor(coeff_tuple, dtype=torch.bfloat16) * scaling_factor) 
+            nn.Parameter(torch.tensor(coeff_tuple, dtype=torch.float32)) 
             for coeff_tuple in init_coefficients
         ])
         
-        # Store scaling factor as a buffer (not a parameter)
-        self.register_buffer('scaling_factor', torch.tensor(scaling_factor, dtype=torch.bfloat16))
-    
     @property
     def degree(self) -> int:
         return len(self.poly_layers[0])
@@ -72,22 +122,19 @@ class GeneralizedNewtonSchulz(nn.Module):
         return (self.degree + 1) // 2
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # Get scaled coefficients
-        scaled_poly_layers = [layer / self.scaling_factor for layer in self.poly_layers]
-        
         # Process batches efficiently 
         if X.ndim == 3:  # Handle batched input [batch, m, n]
-            return self._forward_batch(X, scaled_poly_layers)
+            return self._forward_batch(X)
         else:  # Handle single matrix input [m, n]
-            return zeropower_via_newtonschulz5(X, scaled_poly_layers)
+            return zeropower_via_newtonschulz5(X, self.poly_layers)
     
-    def _forward_batch(self, X: torch.Tensor, scaled_poly_layers) -> torch.Tensor:
+    def _forward_batch(self, X: torch.Tensor) -> torch.Tensor:
         # Efficiently process batch of matrices
         batch_size = X.size(0)
         
         # Try to process in one go if batch size is reasonable
         if batch_size <= 32:  # Threshold based on profiling
-            return zeropower_via_newtonschulz5(X, scaled_poly_layers)
+            return zeropower_via_newtonschulz5(X, self.poly_layers)
         
         # Process larger batches in chunks to avoid OOM
         chunk_size = 16
@@ -96,192 +143,36 @@ class GeneralizedNewtonSchulz(nn.Module):
         for i in range(0, batch_size, chunk_size):
             end_idx = min(i + chunk_size, batch_size)
             chunk = X[i:end_idx]
-            results.append(zeropower_via_newtonschulz5(chunk, scaled_poly_layers))
+            results.append(zeropower_via_newtonschulz5(chunk, self.poly_layers))
             
         return torch.cat(results, dim=0)
     
     def derivative_at_zero(self) -> torch.Tensor:
-        # Scale down the parameters before computing the derivative
-        scaled_coeffs = torch.stack([layer[0] / self.scaling_factor for layer in self.poly_layers])
-        return torch.prod(scaled_coeffs)
+        # return the product of the zeroth coefficient in each layer of self.poly_layers
+        # must be differentiable
+        coeffs = torch.stack([layer[0] for layer in self.poly_layers])
+        return torch.prod(coeffs)
 
     def print_polynomial(self) -> str:
         list_terms = ''
         for i, poly_coeffs in enumerate(self.poly_layers):
-            # Scale down for display
-            scaled_coeffs = (poly_coeffs / self.scaling_factor).tolist()
-            list_terms += f"{scaled_coeffs},\n"
+            list_terms += f"{poly_coeffs.tolist()},\n"
         desmos_terms = ''
         for i, poly_coeffs in enumerate(self.poly_layers):
-            # Scale down for display
-            scaled_coeffs = poly_coeffs / self.scaling_factor
-            desmos_terms += f"f_{i}(x) = {scaled_coeffs[0]}x + {scaled_coeffs[1]}x^3 + {scaled_coeffs[2]}x^5\n"
+            desmos_terms += f"f_{i}(x) = {poly_coeffs[0]}x + {poly_coeffs[1]}x^3 + {poly_coeffs[2]}x^5\n"
         return list_terms + desmos_terms
 
     def evaluate_scalar(self, x: torch.Tensor) -> torch.Tensor:
         for poly_coeffs in self.poly_layers:
-            # Scale down the coefficients for computation
-            scaled_coeffs = poly_coeffs / self.scaling_factor
-            powers = torch.tensor([2 * i + 1 for i in range(len(scaled_coeffs))])
-            x = sum(coeff * torch.pow(x, power) for coeff, power in zip(scaled_coeffs, powers))
+            powers = torch.tensor([2 * i + 1 for i in range(len(poly_coeffs))])
+            x = sum(coeff * torch.pow(x, power) for coeff, power in zip(poly_coeffs, powers))
         return x
-
-@dataclass
-class MatrixSample:
-    name: str
-    shape: Tuple[int, ...]
-    file_path: str
-
-class MatrixDataset(Dataset):
-    def __init__(self, checkpoint_dirs: List[str], pattern: str = "step*.pkl"):
-        # Ensure checkpoint_dirs is a list
-        if isinstance(checkpoint_dirs, str):
-            checkpoint_dirs = [checkpoint_dirs]
-            
-        # Collect files from all directories
-        files = []
-        for checkpoint_dir in checkpoint_dirs:
-            dir_files = sorted(glob.glob(os.path.join(checkpoint_dir, pattern)))[2:]  # Skip first checkpoints
-            files.extend(dir_files)
-            
-        if len(files) < 2:
-            raise ValueError(f"Need at least 2 checkpoints, found {len(files)} across {len(checkpoint_dirs)} directories")
-        
-        # Load first checkpoint from first directory to get matrix shapes
-        with open(files[0], 'rb') as f:
-            first_checkpoint = pickle.load(f)
-        
-        self.samples = [MatrixSample(name, shape, file) 
-                       for file in files 
-                       for name, _, shape in first_checkpoint]
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        sample = self.samples[idx]
-        with open(sample.file_path, 'rb') as f:
-            params = pickle.load(f)
-            for name, matrix, _ in params:
-                if name == sample.name:
-                    return torch.from_numpy(matrix)
-        raise ValueError(f"Matrix {sample.name} not found in {sample.file_path}")
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-def create_dataloader(checkpoint_dirs: List[str], batch_size: int = 8, rank: int = 0, world_size: int = 1) -> DataLoader:
-    dataset = MatrixDataset(checkpoint_dirs)
-    shape_indices = {}
-    
-    for idx, sample in enumerate(dataset.samples):
-        shape_indices.setdefault(sample.shape, []).append(idx)
-    
-    # Adjust batch size based on world size to avoid OOM
-    local_batch_size = max(1, batch_size // world_size)  # Ensure at least 1 sample per batch
-    
-    # Create a DistributedSampler-like class for balanced shape-aware distribution
-    class ShapeDistributedSampler(torch.utils.data.Sampler):
-        def __init__(self):
-            self.epoch = 0  # Track current epoch
-            
-        def set_epoch(self, epoch):
-            """Set the epoch for this sampler to ensure different shuffling per epoch"""
-            self.epoch = epoch
-            
-        def __iter__(self):
-            # Process each shape group separately to maintain shape consistency in batches
-            all_indices = []
-            
-            # Use epoch-dependent seed for consistent but different shuffling each epoch
-            base_seed = 42
-            seed = base_seed + self.epoch
-            
-            for shape, indices in shape_indices.items():
-                # Use deterministic shuffle with epoch-dependent seed
-                g = torch.Generator()
-                g.manual_seed(seed)
-                
-                # Shuffle indices for this shape
-                indices_tensor = torch.tensor(indices, dtype=torch.int64)
-                perm = torch.randperm(len(indices), generator=g)
-                indices_shuffled = indices_tensor[perm].tolist()
-                
-                # Pad to make divisible by (world_size * local_batch_size)
-                # This ensures each process gets equal number of samples
-                padding_size = (world_size * local_batch_size) - (len(indices_shuffled) % (world_size * local_batch_size))
-                if padding_size < world_size * local_batch_size:
-                    # Cycle through indices to pad
-                    padding = indices_shuffled[:padding_size]
-                    indices_padded = indices_shuffled + padding
-                else:
-                    indices_padded = indices_shuffled
-                
-                # Reshape to [num_batches, world_size, local_batch_size]
-                num_samples = len(indices_padded)
-                num_batches = num_samples // (world_size * local_batch_size)
-                
-                # Reshape to distribute evenly across processes
-                indices_reshaped = torch.tensor(indices_padded).view(num_batches, world_size, local_batch_size)
-                
-                # Extract batches for this rank
-                for i in range(num_batches):
-                    # Get this rank's batch for the i-th global batch
-                    batch = indices_reshaped[i, rank].tolist()
-                    all_indices.append(batch)
-            
-            # Shuffle the batches with epoch-dependent seed
-            g = torch.Generator()
-            g.manual_seed(seed + 1)  # Different seed than above but still epoch-dependent
-            batch_perm = torch.randperm(len(all_indices), generator=g)
-            all_indices = [all_indices[i] for i in batch_perm.tolist()]
-            
-            # Return batches assigned to this rank
-            return iter(all_indices)
-            
-        def __len__(self):
-            # Count total batches for this rank
-            total_samples = sum(len(indices) for indices in shape_indices.values())
-            # Add padding to make divisible
-            padded_total = total_samples
-            for indices in shape_indices.values():
-                padding_size = (world_size * local_batch_size) - (len(indices) % (world_size * local_batch_size))
-                if padding_size < world_size * local_batch_size:
-                    padded_total += padding_size
-            
-            return padded_total // (world_size * local_batch_size)
-    
-    # Create sampler instance
-    sampler = ShapeDistributedSampler()
-    
-    # Pin memory for faster GPU transfer
-    return {
-        'dataloader': DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=lambda x: torch.stack(x),
-            num_workers=2,  # Reduced from 4 to save memory
-            pin_memory=True,
-            persistent_workers=True  # Keep workers alive between epochs
-        ),
-        'sampler': sampler  # Return sampler to allow setting epoch
-    }
-
-def naive_loss(model_output):
-    I = torch.eye(model_output.size(-1), device=model_output.device)
-    # Use a more stable version of the loss calculation
-    diff = model_output.transpose(-2, -1) @ model_output - (1 - 1e-8) * I
-    
-    # Normalize by the number of elements in the result matrix (which is n×n)
-    # X can be m×n (rectangular), but X^T X is always n×n
-    n = model_output.size(-1)
-    
-    # Return normalized Frobenius norm
-    return torch.norm(diff, p='fro') / n
 
 def univariate_loss(model, device, lower_bound: float = 0.0, upper_bound: float = 1.0):
     mesh_size = 1_000_000
     x = torch.rand(mesh_size).to(device) * (upper_bound - lower_bound) + lower_bound
     y = model.evaluate_scalar(x)
     return torch.norm(y - 1, p='fro') / mesh_size
-
 
 def train_newton_schulz(config: Dict[str, Any]):
     # Initialize distributed training
@@ -327,44 +218,22 @@ def train_newton_schulz(config: Dict[str, Any]):
     ]
     
     model = GeneralizedNewtonSchulz(
-        init_coefficients=init_coefficients,
-        scaling_factor=config.get('scaling_factor', 32.0)  # Add scaling factor
+        init_coefficients=init_coefficients
     ).to(device)
     
     # Broadcast model parameters from rank 0 to all processes
     for param in model.parameters():
         dist.broadcast(param.data, 0)
     
-    # Create parameter groups with different learning rates
-    # Regular parameters get the base learning rate
-    # Last two quintic polynomials get a higher learning rate (5x)
-    param_groups = [
-        {'params': [p for i, p in enumerate(model.poly_layers) if i < len(model.poly_layers) - 2], 
-         'lr': config['learning_rate']},
-        {'params': [p for i, p in enumerate(model.poly_layers) if i >= len(model.poly_layers) - 2], 
-         'lr': config['learning_rate'] * 5.0}  # 5x higher learning rate for last two layers
-    ]
-    
     # Log the learning rates if master process
     if master_process:
         log(f"Base learning rate: {config['learning_rate']}", console=True)
         log(f"Last two polynomial learning rate: {config['learning_rate'] * 5.0}", console=True)
-        log(f"Using scaling factor: {config.get('scaling_factor', 32.0)}", console=True)
     
     optimizer = torch.optim.Adam(
-        param_groups,
+        model.parameters(),
         betas=config['adam_betas']
     )
-    
-    # Create dataloader with adjusted batch size
-    dataloader_dict = create_dataloader(
-        config['checkpoint_dirs'], 
-        config['batch_size'],
-        rank=rank,
-        world_size=world_size
-    )
-    dataloader = dataloader_dict['dataloader']
-    sampler = dataloader_dict['sampler']
     
     def plot_fn(fn):
         if not master_process:
@@ -400,13 +269,31 @@ def train_newton_schulz(config: Dict[str, Any]):
     if config.get('use_compile', True):
         model = torch.compile(model, dynamic=False, fullgraph=True)
     
+    # Initialize precision bits (start with float32)
+    start_bits = 32
+    target_bits = 16
+    current_bits = start_bits
+    
+    # Setup for plateau detection
+    loss_history = []
+    univariate_loss_history = []  # Track univariate loss separately for plateau detection
+    min_epochs_before_reduction = config.get('min_epochs_before_reduction', 50)
+    plateau_patience = config.get('plateau_patience', 20)
+    plateau_threshold = config.get('plateau_threshold', 0.001)
+    
+    # Dictionary to store hooks
+    hooks = {}
+    
+    # Apply initial hooks
+    for param in model.parameters():
+        hook = param.register_hook(RoundingHook(current_bits))
+        hooks[id(param)] = hook
+    
     for epoch in range(config['num_epochs']):
-        # Set epoch for the sampler to ensure different shuffling each epoch
-        sampler.set_epoch(epoch)
-        
         epoch_loss = 0
         num_batches = 0
         current_loss = 0
+        epoch_univariate_loss = 0  # Track univariate loss for the epoch
         epoch_start_time = time.perf_counter()
 
         # Add a small delay between epochs to ensure all processes are synchronized
@@ -415,16 +302,12 @@ def train_newton_schulz(config: Dict[str, Any]):
             dist.barrier()
 
         for i in range(1000):
-        # for i, matrices in enumerate(dataloader):
-            # Get current elapsed time
             current_elapsed_time = time.perf_counter() - start_time
             univariate_loss_value = univariate_loss(model, device)
             derivative_reward_value = model.derivative_at_zero()
             loss = config['univariate_loss_weight'] * univariate_loss_value - config['derivative_reward_weight'] * derivative_reward_value
             
             if master_process and i % 10 == 0:
-                # log(f"Epoch {epoch}, batch {i}: naive loss: {naive_loss_value.item():.4e}, "
-                    # f"derivative: {derivative_reward_value.item():.4e}, univariate loss: {univariate_loss_value.item():.4e}, Elapsed: {current_elapsed_time:.2f}s", console=True)
                 log(f"Epoch {epoch}, batch {i}: univariate loss: {univariate_loss_value.item():.4e}, "
                     f"derivative: {derivative_reward_value.item():.4e}, Elapsed: {current_elapsed_time:.2f}s", console=True)
             
@@ -439,24 +322,30 @@ def train_newton_schulz(config: Dict[str, Any]):
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_threshold)
             optimizer.step()
             
+            # Ensure parameters maintain truncation after optimizer update
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.copy_(round_to_precision(param, current_bits))
+            
             optimizer.zero_grad(set_to_none=True)
             
             current_loss += loss.item()
             epoch_loss += loss.item()
+            epoch_univariate_loss += univariate_loss_value.item()  # Accumulate univariate loss
             num_batches += 1
             
             # Log to wandb periodically
             if (i + 1) % config['accumulation_steps'] == 0 and master_process:
                 wandb.log({
                     "loss": current_loss / config['accumulation_steps'],
-                    # "naive_loss": naive_loss_value.item(),
                     "derivative": derivative_reward_value.item(),
-                    "univariate_loss": univariate_loss_value.item()
+                    "univariate_loss": univariate_loss_value.item(),
+                    "current_bits": current_bits,
+                    "mantissa_bits": current_bits - 9
                 })
                 current_loss = 0
             
             # Free memory
-            # del matrices
             torch.cuda.empty_cache() if config.get('aggressive_memory_cleanup', False) else None
 
         # Log epoch statistics
@@ -464,13 +353,72 @@ def train_newton_schulz(config: Dict[str, Any]):
         epoch_time = time.perf_counter() - epoch_start_time
         total_train_time += epoch_time
         
+        # Calculate average loss for this epoch
+        avg_epoch_loss = epoch_loss/max(1, num_batches)
+        avg_univariate_loss = epoch_univariate_loss/max(1, num_batches)  # Calculate average univariate loss
+        loss_history.append(avg_epoch_loss)
+        univariate_loss_history.append(avg_univariate_loss)  # Store for plateau detection
+        
+        # Check for plateau and reduce precision if needed - use univariate loss for plateau detection
+        if epoch >= min_epochs_before_reduction and current_bits > target_bits:
+            # Check last plateau_patience epochs for plateauing
+            if len(univariate_loss_history) >= plateau_patience:
+                recent_losses = univariate_loss_history[-plateau_patience:]
+                
+                # Calculate relative change in univariate loss
+                start_loss = recent_losses[0]
+                end_loss = recent_losses[-1]
+                loss_change = abs(end_loss - start_loss) / (abs(start_loss) + 1e-10)
+                
+                # Check if univariate loss has plateaued
+                if loss_change < plateau_threshold:
+                    # Reduce precision by 1 bit
+                    current_bits -= 1
+                    current_bits = max(current_bits, target_bits)
+                    
+                    if master_process:
+                        log(f"Univariate loss plateaued with change {loss_change:.6f} < threshold {plateau_threshold}. "
+                            f"Reducing precision to {current_bits} bits (mantissa: {current_bits - 9} bits)", console=True)
+                    
+                    # Remove old hooks
+                    for param_id in list(hooks.keys()):
+                        hooks[param_id].remove()
+                        del hooks[param_id]
+                    
+                    # Apply truncation and register new hooks
+                    for param in model.parameters():
+                        # Truncate the parameter
+                        param.data.copy_(round_to_precision(param.data, current_bits))
+                        
+                        # Register hook for maintaining truncation during updates
+                        hook = param.register_hook(RoundingHook(current_bits))
+                        hooks[id(param)] = hook
+                    
+                    # Reset loss histories after reducing precision
+                    loss_history = []
+                    univariate_loss_history = []
+        
         if master_process:
-            log(f"Epoch {epoch}/{config['num_epochs']} completed in {epoch_time:.2f}s, avg_loss: {epoch_loss/max(1, num_batches):.6f}", console=True)
+            log(f"Epoch {epoch}/{config['num_epochs']} completed in {epoch_time:.2f}s, avg_loss: {avg_epoch_loss:.6f}, "
+                f"avg_univariate_loss: {avg_univariate_loss:.6f}, bits: {current_bits}", console=True)
+            
+            # Log parameter values in float32 and bfloat16 for comparison
+            if epoch % 10 == 0:
+                for i, param in enumerate(model.parameters()):
+                    bfloat16_param = param.data.clone().bfloat16().float()
+                    log(f"Parameter {i}, float32: {param.data.flatten()[0].item()}, bfloat16: {bfloat16_param.flatten()[0].item()}", console=True)
+                    # Test if our truncation matches bfloat16
+                    truncated = round_to_precision(param.data, 16)
+                    log(f"Rounded to 16: {truncated.flatten()[0].item()}", console=True)
+            
             wandb.log({
                 "epoch": epoch,
-                "avg_epoch_loss": epoch_loss / max(1, num_batches),
+                "avg_epoch_loss": avg_epoch_loss,
+                "avg_univariate_loss": avg_univariate_loss,
                 "epoch_time": epoch_time,
                 "polynomial": plot_fn(model.evaluate_scalar),
+                "current_bits": current_bits,
+                "mantissa_bits": current_bits - 9
             })
             
             log(model.print_polynomial(), console=True)
@@ -484,11 +432,26 @@ def train_newton_schulz(config: Dict[str, Any]):
         log(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
         
+        # Convert final model to bfloat16 for verification
+        bfloat16_model = model
+        for param in bfloat16_model.parameters():
+            param.data = param.data.bfloat16()
+        
+        # Test the bfloat16 model
+        try:
+            bfloat16_test = univariate_loss(bfloat16_model, device)
+            log(f"bfloat16 univariate loss: {bfloat16_test.item():.4e}", console=True)
+        except Exception as e:
+            log(f"bfloat16 test failed: {str(e)}", console=True)
+        
         # Finish wandb run
         if run is not None:
             run.finish()
     
     # Clean up
+    for param_id in list(hooks.keys()):
+        hooks[param_id].remove()
+    
     dist.destroy_process_group()
 
 if __name__ == "__main__":
@@ -499,23 +462,25 @@ if __name__ == "__main__":
         "adam_betas": (0.8, 0.8),
         "batch_size": 64,  # Global batch size
         "batch_size_per_gpu": 8,  # Per-GPU batch size (will override global batch size)
-        "accumulation_steps": 3,
+        "accumulation_steps": 1,
         "max_grad_norm": 1e-3,
-        "num_epochs": 10000,
-        "derivative_reward_weight": 1e-6,
+        "num_epochs": 5000,
+        "min_epochs_before_reduction": 5,  # Minimum epochs before allowing precision reduction
+        "plateau_patience": 5,  # Number of epochs to check for plateau
+        "plateau_threshold": 0.001,  # Relative change threshold to detect plateau
+        "derivative_reward_weight": 1e-5,
         "univariate_loss_weight": 1000,
         "save_checkpoints": True,
         "use_compile": True,  # Use torch.compile
         "aggressive_memory_cleanup": False,  # Enable for extreme OOM cases
-        "scaling_factor": 32.0,  # Add scaling factor for bfloat16 training
         "init_coefficients": [
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
+            [4.510918617248535, -7.218330383300781, 2.7313356399536133],
+            [4.605247974395752, -6.573604106903076, 2.3541903495788574],
+            [4.919572353363037, -5.963148593902588, 1.814536452293396],
+            [4.132555961608887, -3.550161123275757, 0.7916041016578674],
+            [3.9480252265930176, -3.3081469535827637, 0.7301044464111328],
+            [2.495997905731201, -1.7606257200241089, 0.3820432126522064],
+            [2.0578646659851074, -1.5518815517425537, 0.48931562900543213],
         ]
     }
     

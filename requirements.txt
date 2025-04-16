@@ -2,3 +2,6 @@ numpy
 tqdm
 torch
 huggingface-hub
+pandas
+matplotlib
+imageio

@@ -1,3 +1,7 @@
+nanogpt-venv
+wandb
+nohup.out
+
 fineweb10B/
 pylog124M/
 __pycache__/

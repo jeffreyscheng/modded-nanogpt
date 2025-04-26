@@ -477,6 +477,9 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    desync_minibatch = 125
+    sync_every = 5
+
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -541,7 +544,21 @@ adam_param_groups = [dict(params=head_params, lr=0.1/1024**0.5), dict(params=emb
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, fused=True)
 optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+# ---------------- DiLoCo bookkeeping ----------------
+outer_opt = torch.optim.SGD(
+    hidden_matrix_params,      # ← same parameter list
+    lr=1.0,                    # learning-rate
+    momentum=0.9,              # outer momentum
+    nesterov=True
+)
+prev_params = [p.detach().clone() for p in hidden_matrix_params]
+local_steps_since_sync = 0
+diloco_active = False
+# ----------------------------------------------------
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
+outer_optimizer = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+last_sync_params: list[torch.Tensor] | None = None
+
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
 opt2params = {opt: opt_params(opt) for opt in optimizers}
@@ -627,11 +644,12 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        wandb.log({
-            "val_loss": val_loss.item(),
-            "train_time_ms": training_time_ms,
-            "step": step,
-        })
+        if master_process:
+            wandb.log({
+                "val_loss": val_loss.item(),
+                "train_time_ms": training_time_ms,
+                "step": step,
+            })
         if hasattr(model, "skip_weights"):
             print0(s=f"{model.skip_weights}")
         print0(s="\n".join([f"{i} {block.lambdas.tolist()}" for i, block in enumerate(model.blocks)]))
@@ -652,10 +670,14 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
+    # decide whether this minibatch needs all-reduce
+    need_sync = step < args.desync_minibatch
     opt2works = {
-        opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True) for p in params]
+        opt: ([dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True) for p in params]
+            if need_sync else [])
         for opt, params in opt2params.items()
     }
+
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -670,6 +692,38 @@ for step in range(train_steps + 1):
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # ------------ outer-momentum warm-up (before desync) -------------
+    if step < args.desync_minibatch:
+        for p, p_prev in zip(hidden_matrix_params, prev_params):
+            p.grad = p.data - p_prev           # Δ
+            p_prev.copy_(p.data)
+
+        saved_lr = outer_opt.param_groups[0]["lr"]
+        outer_opt.param_groups[0]["lr"] = 0.0  # freeze weights
+        outer_opt.step()                       # fills momentum buf
+        outer_opt.zero_grad(set_to_none=True)
+        outer_opt.param_groups[0]["lr"] = saved_lr
+    # -----------------------------------------------------------------
+    # ---------------- DiLoCo outer-step ------------------
+    if step >= args.desync_minibatch:            # start desynchronised phase
+        diloco_active = True
+    if diloco_active:
+        local_steps_since_sync += 1
+        if local_steps_since_sync == args.sync_every:
+            # form and all-reduce “outer” gradients
+            for p, p_prev in zip(hidden_matrix_params, prev_params):
+                p.grad = p.data - p_prev          # Δ = W_t − W_{t-sync}
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            # outer Muon step (uses the averaged Δ)
+            outer_opt.step()
+            outer_opt.zero_grad(set_to_none=True)
+            # broadcast the fresh global weights and reset state
+            for p, p_prev in zip(hidden_matrix_params, prev_params):
+                dist.broadcast(p.data, 0)         # same W_{t+1} everywhere
+                p_prev.copy_(p.data)              # new reference point
+            local_steps_since_sync = 0
+    # -----------------------------------------------------
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)

@@ -118,22 +118,40 @@ def make_soup_picture(
     alpha = np.linspace(0, 1, grid_size)
     beta = np.linspace(0, 1, grid_size)
     loss_grid = np.zeros((grid_size, grid_size))
+    # Set the entire grid to NaN initially, we'll only fill in valid points
+    loss_grid.fill(np.nan)
     
     # Evaluate each grid point
-    total_points = grid_size * grid_size
+    total_valid_points = 0
     for i in range(grid_size):
+        a = alpha[i]
+        # Only calculate points under the line y=1-x
         for j in range(grid_size):
-            a, b = alpha[i], beta[j]
-            w_early = max(0, 1 - a - b)
-            w_late1, w_late2 = a, b
-            
-            # Skip points outside the triangle
-            if w_early < 0:
-                loss_grid[j, i] = float('nan')
+            b = beta[j]
+            # Only calculate points where a + b <= 1 (under the line y=1-x)
+            if a + b <= 1:
+                total_valid_points += 1
+    
+    if rank == 0:
+        print(f"Calculating {total_valid_points} points under the line y=1-x")
+    
+    # Process all valid points
+    point_count = 0
+    for i in range(grid_size):
+        a = alpha[i]
+        for j in range(grid_size):
+            b = beta[j]
+            # Skip points outside the triangle (where a + b > 1)
+            if a + b > 1:
                 continue
                 
+            w_early = 1 - a - b
+            w_late1, w_late2 = a, b
+            
+            point_count += 1
+            
             if rank == 0:
-                print(f"Point {i*grid_size+j+1}/{total_points}: ({a:.2f}, {b:.2f})")
+                print(f"Point {point_count}/{total_valid_points}: ({a:.2f}, {b:.2f})")
                 
                 # Get all possible keys, standardizing them
                 all_keys_early = set(state_dict_early.keys())

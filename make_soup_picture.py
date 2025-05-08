@@ -552,7 +552,7 @@ if __name__ == "__main__":
     starting_minibatch_steps = [125, 4000, 2000]
     forward_iteration_values = [200, 100, 50, 20, 10, 1]
     margin = 0.2
-    grid_size = 20
+    grid_size = 10
     
     # Storage for all dataframes
     all_dataframes = []

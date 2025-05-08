@@ -147,55 +147,51 @@ def interpolate_models(models, weights):
     
     return interpolated_model
 
-def compute_validation_loss(model, rank=0, world_size=1, device="cuda", seed=42):
+def run_validation(model, step, args, rank, world_size, seed):
     """
-    Compute the validation loss for a given model.
+    Run validation on the given model.
     
     Args:
         model: The model to evaluate
-        rank: Process rank (for distributed training)
-        world_size: Total number of processes (for distributed training)
-        device: Device to run validation on
-        seed: Random seed for validation data
+        step: Current training step
+        start_step: Starting step of training
+        training_time_ms: Training time so far in milliseconds
+        print0_local: Function to print on master process
+        args: Hyperparameters
+        rank: Process rank for distributed training
+        world_size: Number of processes
+        seed: Random seed
+        train_steps: Total training steps
         
     Returns:
         float: The validation loss
     """
-    args = Hyperparameters()
-    
     # Set model to evaluation mode
     model.eval()
     
     # Configure validation parameters
     val_batch_size = world_size * args.val_seq_len
-    
-    # Calculate validation steps using the same formula as in training
+    assert args.val_tokens % val_batch_size == 0
     val_steps = args.val_tokens // val_batch_size
     
     # Create validation data generator
-    val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size, seed=seed)
+    val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size, seed=seed + 10000)  # Different seed for validation
     
     # Compute validation loss
     val_loss = 0
     with torch.no_grad():
         for _ in range(val_steps):
             inputs, targets = next(val_loader)
-            # Ensure inputs are int32 as expected by the model
-            if inputs.dtype != torch.int32:
-                inputs = inputs.to(torch.int32)
-            
-            # Forward pass with the correct window size blocks
-            val_loss += model(inputs, targets, get_window_size_blocks(0))
-    
+            val_loss += model(inputs, targets, get_window_size_blocks(step))
     val_loss /= val_steps
+    del val_loader
     
-    # Average loss across all processes if in distributed mode
-    if dist.is_initialized() and world_size > 1:
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+    # Average loss across all processes
+    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
     
-    return val_loss.item()
+    return val_loss
 
-def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_dir=None):
+def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_path=None):
     # Set PyTorch random seed for reproducibility
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -220,17 +216,6 @@ def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_
     # Skip init_process_group as it's now handled by the caller
     # dist.init_process_group(backend="nccl", device_id=device)
     master_process = (rank == 0) # this process will do logging, checkpointing etc.
-
-    # Set up output directory for final model
-    if output_dir is None:
-        output_dir = "logs"
-        
-    # Determine if output_dir is a directory or a complete filepath
-    is_filepath = output_dir.endswith('.pt')
-    
-    # If it's a directory, create it
-    if not is_filepath and master_process and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
 
     # begin logging
     if master_process:
@@ -262,7 +247,6 @@ def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_
     if checkpoint_path:
         print0_local(f"Loading checkpoint from: {checkpoint_path}")
     print0_local(f"Number of iterations: {iterations}")
-    print0_local(f"Output directory: {output_dir}")
     print0_local(nvidia_smi())
     print0_local("="*100)
 
@@ -378,29 +362,7 @@ def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_
         if master_process:
             print0_local(f"Resuming from step {start_step}", console=True)
     
-    # Calculate end step based on iterations parameter
-    # If iterations is small (like 1-10), treat it as relative to start_step
-    # Otherwise treat it as an absolute iteration count
-    if iterations < 100 and start_step > 0:
-        end_step = start_step + iterations
-        print0_local(f"Will train for {iterations} more iterations (from {start_step} to {end_step})", console=True)
-    else:
-        end_step = iterations
-        print0_local(f"Will train until iteration {end_step} (currently at {start_step})", console=True)
-        
-    # Handle case where we're just loading a checkpoint and not training further
-    if start_step >= end_step:
-        if master_process:
-            print0_local(f"No additional training needed (start_step={start_step}, end_step={end_step})", console=True)
-            # Save the model to output_dir
-            is_filepath = output_dir.endswith('.pt')
-            final_checkpoint_path = output_dir if is_filepath else f"{output_dir}/final_model_seed{seed}_step{start_step:06d}.pt"
-            os.makedirs(os.path.dirname(final_checkpoint_path), exist_ok=True)
-            log = dict(step=start_step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            torch.save(log, final_checkpoint_path)
-            print0_local(f"Saved loaded model to {final_checkpoint_path}", console=True)
-        # Don't destroy process group here, let the caller handle it
-        return 0.0  # Return dummy validation loss
+    end_step = start_step + iterations
 
     # NOW compile the model AFTER loading the checkpoint
     model: torch.nn.Module = torch.compile(model, dynamic=False)
@@ -469,39 +431,25 @@ def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_
     train_steps = end_step
     for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
-
-        # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step:
             # stop the clock
             # dist.barrier() # Removed, now handled by the caller
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_batch_size = world_size * args.val_seq_len
             assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
             # Also pass the seed to validation data loader
-            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size, seed=seed + 10000)  # Different seed for validation
-            val_loss = 0
-            with torch.no_grad():
-                for _ in range(val_steps):
-                    inputs, targets = next(val_loader)
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
-            val_loss /= val_steps
-            del val_loader
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss = run_validation(model, step, args, rank, world_size, seed)
             print0_local(f"step:{step}/{train_steps} val_loss:{val_loss:.6f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step - start_step, 1):.2f}ms", console=True)
             model.train()
             # start the clock again
             # dist.barrier() # Removed, now handled by the caller
             t0 = time.perf_counter()
 
-        if last_step:
-            if master_process:
-                final_checkpoint_path = f"{output_dir}/final_model_seed{seed}_step{step:06d}.pt"
-                os.makedirs(os.path.dirname(final_checkpoint_path), exist_ok=True)    
+            if master_process: 
                 log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                torch.save(log, final_checkpoint_path)
-                print0_local(f"Saved final model to {final_checkpoint_path}", console=True)
+                torch.save(log, output_path)
+                print0_local(f"Saved final model to {output_path}", console=True)
             # the last step only has the validation loop, so break to avoid training
             break
 
@@ -531,10 +479,9 @@ def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_
 
     print0_local(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-    # Don't destroy process group here, let the caller handle it
-    return val_loss # Return final validation loss
 
 if __name__ == "__main__":
+    tick = time.perf_counter()
     # Initialize the process group once for all runs
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -543,21 +490,29 @@ if __name__ == "__main__":
     dist.init_process_group(backend="nccl", device_id=device)
     
     try:
-        starting_minibatch_step = 2000
-        forward_iterations = 1
-        checkpoint_path = f"/home/paperspace/dev/modded-nanogpt/logs/gptm_record/state_step{starting_minibatch_step:06d}.pt"
-        
-        # Create the parent directory for output files if it doesn't exist
-        output_parent_dir = "/home/paperspace/dev/modded-nanogpt/souping_logs"
-        os.makedirs(output_parent_dir, exist_ok=True)
-        
-        for seed in range(8):
-            print(f"Starting seed {seed}")
-            output_dir = f"{output_parent_dir}/step{starting_minibatch_step:06d}_seed{seed}_forward{forward_iterations}.pt"
-            train_model(seed=seed, run_id=0, iterations=forward_iterations, 
-                        checkpoint_path=checkpoint_path, output_dir=output_dir)
-            # synchronize
-            dist.barrier()
+        record_names = ["gptm_record", "gptm_adam"]  # or gptm_adam
+        starting_minibatch_steps = [125, 2000, 4000]
+        forward_iteration_values = [200, 100, 50, 20, 10, 1]
+        num_seeds = 2
+        for record_name in record_names:
+            for starting_minibatch_step in starting_minibatch_steps:
+                for forward_iterations in forward_iteration_values:
+                    checkpoint_path = f"/home/paperspace/dev/modded-nanogpt/logs/{record_name}/state_step{starting_minibatch_step:06d}.pt"
+                    # get the name of the folder in the checkpoint path.  should be one level above the file name
+                    # i only want the folder name, not the full path
+                    folder_name = os.path.basename(os.path.dirname(checkpoint_path))
+                    
+                    # Create the parent directory for output files if it doesn't exist
+                    output_parent_dir = f"/home/paperspace/dev/modded-nanogpt/souping_logs/{folder_name}_step{starting_minibatch_step:06d}"
+                    os.makedirs(output_parent_dir, exist_ok=True)
+                    
+                    for seed in range(num_seeds):
+                        print(f"Starting seed {seed}")
+                        output_path = f"{output_parent_dir}/seed{seed}_forward{forward_iterations}.pt"
+                        train_model(seed=seed, run_id=0, iterations=forward_iterations, 
+                                    checkpoint_path=checkpoint_path, output_path=output_path)
+                        # synchronize
+                        dist.barrier()
             
         # Only destroy the process group once, at the very end
         dist.destroy_process_group()
@@ -566,3 +521,6 @@ if __name__ == "__main__":
         if dist.is_initialized():
             dist.destroy_process_group()
         raise e
+    finally:
+        if rank == 0:
+            print(f"Total time taken: {time.perf_counter() - tick:.2f} seconds")

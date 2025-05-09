@@ -23,7 +23,7 @@ from gpt_static import (
     zeropower_via_newtonschulz5, update, norm, init_linear, next_multiple_of_n,
     _load_data_shard, distributed_data_generator, get_lr, get_window_size_blocks_helper,
     get_window_size_blocks, nvidia_smi, print0, opt_params, 
-    Muon, Rotary, CausalSelfAttention, MLP, Block, GPT, Hyperparameters
+    Muon, Rotary, CausalSelfAttention, MLP, Block, GPT, Hyperparameters, run_validation
 )
 
 def load_checkpoint(checkpoint_path, device="cuda", rank=0):
@@ -146,50 +146,6 @@ def interpolate_models(models, weights):
                     param.add_(model_params[i][name] * weight)
     
     return interpolated_model
-
-def run_validation(model, step, args, rank, world_size, seed):
-    """
-    Run validation on the given model.
-    
-    Args:
-        model: The model to evaluate
-        step: Current training step
-        start_step: Starting step of training
-        training_time_ms: Training time so far in milliseconds
-        print0_local: Function to print on master process
-        args: Hyperparameters
-        rank: Process rank for distributed training
-        world_size: Number of processes
-        seed: Random seed
-        train_steps: Total training steps
-        
-    Returns:
-        float: The validation loss
-    """
-    # Set model to evaluation mode
-    model.eval()
-    
-    # Configure validation parameters
-    val_batch_size = world_size * args.val_seq_len
-    assert args.val_tokens % val_batch_size == 0
-    val_steps = args.val_tokens // val_batch_size
-    
-    # Create validation data generator
-    val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size, seed=seed + 10000)  # Different seed for validation
-    
-    # Compute validation loss
-    val_loss = 0
-    with torch.no_grad():
-        for _ in range(val_steps):
-            inputs, targets = next(val_loader)
-            val_loss += model(inputs, targets, get_window_size_blocks(step))
-    val_loss /= val_steps
-    del val_loader
-    
-    # Average loss across all processes
-    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-    
-    return val_loss
 
 def train_model(seed=0, run_id=0, iterations=None, checkpoint_path=None, output_path=None):
     # Set PyTorch random seed for reproducibility

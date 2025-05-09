@@ -2,73 +2,12 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from train_gptm_short import Hyperparameters, GPT, get_window_size_blocks, distributed_data_generator, run_validation
+from gpt_static import Hyperparameters, GPT, run_validation, load_checkpoint_local, load_state_dict_safely
 import torch.distributed as dist
 import gc
 import pandas as pd
 from itertools import product
 from matplotlib.colors import PowerNorm
-
-def load_checkpoint_local(checkpoint_path, device="cpu"):
-    """
-    Load a model checkpoint without using distributed operations.
-    Returns the state dict and step only.
-    """
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
-    
-    print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    step = checkpoint.get('step', 0)
-    
-    # Fix state dict keys - remove '_orig_mod.' prefix for compiled models
-    model_state_dict = checkpoint['model']
-    
-    # Create a new state dict with standardized keys
-    fixed_state_dict = {}
-    for key, value in model_state_dict.items():
-        # Remove any '_orig_mod.' prefix
-        fixed_key = key
-        if key.startswith('_orig_mod.'):
-            fixed_key = key[len('_orig_mod.'):]
-            
-        # Convert parameters to bfloat16 if needed
-        if isinstance(value, torch.Tensor) and value.dtype != torch.bfloat16 and value.is_floating_point():
-            value = value.to(torch.bfloat16)
-            
-        fixed_state_dict[fixed_key] = value
-    
-    return fixed_state_dict, step
-
-def load_state_dict_safely(model, state_dict, strict=False):
-    """Safely load a state dictionary into a model, handling prefixes correctly."""
-    # Get model keys
-    model_keys = set(k for k, _ in model.named_parameters())
-    
-    # Create a fixed state dict with matching keys
-    fixed_state_dict = {}
-    for key, value in state_dict.items():
-        # Try to find the correct key for this parameter
-        if key in model_keys:
-            # Direct match
-            fixed_state_dict[key] = value
-        elif key.startswith('_orig_mod.') and key[len('_orig_mod.'):] in model_keys:
-            # Remove prefix
-            fixed_key = key[len('_orig_mod.'):]
-            fixed_state_dict[fixed_key] = value
-        elif f"_orig_mod.{key}" in model_keys:
-            # Add prefix
-            fixed_key = f"_orig_mod.{key}"
-            fixed_state_dict[fixed_key] = value
-        else:
-            # Best effort - keep original key
-            fixed_state_dict[key] = value
-    
-    # Load the state dict
-    model.load_state_dict(fixed_state_dict, strict=strict)
-    
-    # Return success
-    return True
 
 def calculate_loss_landscape(
     record_name, step, forward_iterations, early_path, late_path1, late_path2, 
@@ -121,15 +60,6 @@ def calculate_loss_landscape(
     alpha = np.linspace(0 - margin, 1 + margin, grid_size)
     beta = np.linspace(0 - margin, 1 + margin, grid_size)
     loss_data = []
-    
-    # Original triangle vertices
-    orig_vertices = np.array([[0, 0], [1, 0], [0, 1]])
-    # Expanded triangle vertices with margin
-    expanded_vertices = np.array([
-        [0 - margin, 0 - margin], 
-        [1 + margin, 0 - margin], 
-        [0 - margin, 1 + margin]
-    ])
     
     # Evaluate each grid point
     total_valid_points = 0
@@ -267,7 +197,7 @@ def calculate_loss_landscape(
     df = pd.DataFrame(loss_data)
     return df
 
-def plot_soupy_landscape(dataframes, output_dir="souping_imgs", margin=0.2):
+def plot_soupy_landscape(dataframes, output_dir="souping_imgs", margin=0.2, record_name=None):
     """Create a compound plot from multiple loss landscape dataframes
     
     Args:
@@ -341,7 +271,7 @@ def plot_soupy_landscape(dataframes, output_dir="souping_imgs", margin=0.2):
         })
         
         # Use a standard continuous colormap more sensitive to low values
-        cmap = plt.cm.hsv  # Reversed viridis (dark blue for low values, yellow for high)
+        cmap = plt.cm.gist_ncar
         
         # Create a normalization that emphasizes lower values
         if global_min is not None and global_max is not None:
@@ -495,9 +425,12 @@ def plot_soupy_landscape(dataframes, output_dir="souping_imgs", margin=0.2):
         # Add colorbar using the shared contour
         if shared_contour is not None:
             cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-            cbar = fig.colorbar(shared_contour, cax=cbar_ax)
+            cbar = fig.colorbar(shared_contour, cax=cbar_ax, ticks=np.linspace(global_min, global_max, 20))
             cbar.ax.tick_params(labelsize=8)
             cbar.set_label('Loss', size=10, labelpad=8)
+            # Make the colorbar more continuous by increasing number of colors
+            plt.set_cmap('gist_ncar')
+            cbar.mappable.set_clim(global_min, global_max)
             
             # Add min/max labels to colorbar
             if global_min is not None and global_max is not None:
@@ -511,6 +444,7 @@ def plot_soupy_landscape(dataframes, output_dir="souping_imgs", margin=0.2):
         plt.tight_layout(rect=[0.03, 0.03, 0.9, 0.95])
         
         # Save figure
+        plt.title(f'Parameter Interpolation Loss Landscape - {record_name}')
         output_path = os.path.join(output_dir, f"{record_name}_compound.png")
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
@@ -566,33 +500,39 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"Starting data collection for {record_name}, step {step}, forward {forward_iterations}")
         
-        # Calculate loss landscape
-        df = calculate_loss_landscape(
-            record_name=record_name,
-            step=step,
-            forward_iterations=forward_iterations,
-            early_path=early_path,
-            late_path1=late_path1,
-            late_path2=late_path2,
-            grid_size=grid_size,
-            world_size=world_size,
-            rank=rank,
-            device=device,
-            margin=margin
-        )
+        output_csv_path = f"souping_data/{record_name}_step{step}_forward{forward_iterations}.csv"
+        # if not os.path.exists(output_csv_path):
+        #     print(f"Calculating loss landscape for {record_name}, step {step}, forward {forward_iterations}")
+        #     # Calculate loss landscape
+        #     df = calculate_loss_landscape(
+        #         record_name=record_name,
+        #         step=step,
+        #         forward_iterations=forward_iterations,
+        #         early_path=early_path,
+        #         late_path1=late_path1,
+        #         late_path2=late_path2,
+        #         grid_size=grid_size,
+        #         world_size=world_size,
+        #         rank=rank,
+        #         device=device,
+        #         margin=margin
+        #     )
         
-        # Save to list if on rank 0
-        if rank == 0:
-            all_dataframes.append(df)
-            
-            # Also save individual dataframe
-            os.makedirs("souping_data", exist_ok=True)
-            df.to_csv(f"souping_data/{record_name}_step{step}_forward{forward_iterations}.csv", index=False)
+        #     # Save to list if on rank 0
+        #     if rank == 0:
+        #         all_dataframes.append(df)
+                
+        #         # Also save individual dataframe
+        #         os.makedirs("souping_data", exist_ok=True)
+        #         df.to_csv(output_csv_path, index=False)
+        # else:
+            # print(f"Skipping {record_name}, step {step}, forward {forward_iterations} because it already exists")
     
-    all_dataframes = [pd.read_csv(f"souping_data/{f}") for f in os.listdir("souping_data") if f.endswith('.csv')]
-    # Create compound plots for each record type
-    if rank == 0 and all_dataframes:
-        plot_soupy_landscape(all_dataframes, margin=margin)
+    for record in ["gptm_adam", "gptm_record"]:
+        dfs = [pd.read_csv(f"souping_data/{f}") for f in os.listdir("souping_data") if f.endswith('.csv') and record in f]
+        # Create compound plots for each record type
+        if rank == 0 and dfs:
+            plot_soupy_landscape(dfs, margin=margin, record_name=record)
     
     # Clean up
     if dist.is_initialized():

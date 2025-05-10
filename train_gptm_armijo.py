@@ -1,353 +1,172 @@
 """
-train_gptm_armijo.py
-====================
-Back‑tracking Armijo search that chooses a step size **alpha** along the joint
-*optimiser update direction* D so that the **validation loss** is minimised.
+train_gptm_armijo.py  —  concise edition
+========================================
+One‑dimensional line‑search that finds the **validation‑loss‑minimising** step
+size α along the combined optimiser update direction **D**.
 
-This version fixes the checkpoint‑loading mismatch that you spotted:
-
-* Training writes `optimizers=[opt1_state, opt2_state]` (a *list*).  We now
-  recreate **both** optimisers (AdamW + Muon) in the same order and load that
-  list correctly.
-* The search therefore uses the *exact* combined update of both optimisers
-  when computing D.
-
-Memory rules remain unchanged: only one full copy of the model lives on GPU at
-any time; direction and reference weights are kept on CPU.
+* supports multi‑GPU via NCCL (each rank → its own GPU)
+* keeps a **single** model copy on device; weights + D live on CPU
+* works with *any* Muon checkpoint (adds/casts missing `mantissa` buffers)
+* minimisation = bracket + Golden‑section search (tol = 1e‑4)
 """
 
 from __future__ import annotations
-
-import os
-import gc
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import os, gc, torch, torch.distributed as dist, torch.nn as nn
 from typing import List, Tuple
-
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-
 from gpt_static import (
-    Hyperparameters,
-    GPT,
-    Muon,  # custom optimiser defined in gpt_static
-    run_validation,
-    load_state_dict_safely,
-    distributed_data_generator,
-    get_window_size_blocks,
+    Hyperparameters as HP, GPT, Muon, run_validation, load_state_dict_safely,
+    distributed_data_generator as ddg, get_window_size_blocks as wsize,
 )
 
-import torch, gc, inspect, os, sys
-from collections import defaultdict
-
-import os, torch, torch.distributed as dist
-
-# --- distributed init (env:// works with torchrun) --------------------------
+# ── distributed bootstrap ───────────────────────────────────────────────────
 if not dist.is_initialized():
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group("nccl", init_method="env://")
+rank, world = dist.get_rank(), dist.get_world_size()
+local = int(os.environ.get("LOCAL_RANK", rank))
+torch.cuda.set_device(local)
+DEV = torch.device(f"cuda:{local}")
 
-rank        = dist.get_rank()         # 0‑‑7
-world_size  = dist.get_world_size()
-local_rank  = int(os.environ.get("LOCAL_RANK", rank))   # 0‑‑7 on a single node
+hp = HP()
 
-torch.cuda.set_device(local_rank)
-device = torch.device(f"cuda:{local_rank}")
+# ── helpers ─────────────────────────────────────────────────────────────────
 
-if rank == 0:
-    print(f"rank {rank}/{world_size} using {device}")
-
-# -----------------------------------------------------------------------------
-# Armijo hyper‑parameters
-# -----------------------------------------------------------------------------
-starting_alpha = 4.0
-shrink = 0.5          # alpha <- alpha * shrink each back‑track step
-min_alpha = 1e-5
-armijo_c1 = 1e-4      # sufficient‑decrease constant
-
-# -----------------------------------------------------------------------------
-# Model helpers (copied from make_soup_picture.py style)
-# -----------------------------------------------------------------------------
-
-def _build_model(device: str) -> GPT:
-    """Create and compile the same GPT‑M architecture used during training."""
-    hp = Hyperparameters()
-    model = GPT(
-        vocab_size=hp.vocab_size,
-        num_layers=16,
-        num_heads=8,
-        model_dim=1024,
-        max_seq_len=max(hp.train_seq_len, hp.val_seq_len),
-    ).to(device)
-
-    # cast embeddings to bf16 (as done in make_soup_picture.py)
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.weight.data = m.weight.data.to(torch.bfloat16)
-    for p in model.parameters():
-        if p.is_floating_point() and p.dtype != torch.bfloat16:
-            p.data = p.data.to(torch.bfloat16)
-
-    model = torch.compile(model, dynamic=False)
-    return model
+def build_model() -> GPT:
+    m = GPT(hp.vocab_size, 16, 8, 1024, max(hp.train_seq_len, hp.val_seq_len)).to(DEV)
+    for p in m.parameters(): p.data = p.data.to(torch.bfloat16)
+    return torch.compile(m, dynamic=False)
 
 
-# -----------------------------------------------------------------------------
-# Optimiser helpers
-# -----------------------------------------------------------------------------
-
-def _build_optimizers(
-    model: GPT,
-    rank: int,
-    world_size: int,
-    optimizer_states: List[dict] | None,
-    global_step: int,
-) -> List[torch.optim.Optimizer]:
-    hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
-    embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
-    scalar_params = [model.scalars]
-    head_params: list[nn.Parameter] = [model.lm_head_w]
-    # sanity check
-    params_collections = [hidden_matrix_params, embed_params, scalar_params, head_params]
-    optimized_parameters_set = {p for params in params_collections for p in params}
-    assert optimized_parameters_set == {*model.parameters()}
-    assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
-
-    # init the optimizer(s)
-    adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
-
-    opt1 = torch.optim.AdamW(
-        adam_param_groups,
-        betas=(0.8, 0.95),
-        eps=1e-10,
-        weight_decay=0.0,
-        fused=True,
-    )
-    opt2 = Muon(
-        hidden_matrix_params,
-        lr=0.025,
-        momentum=0.95,
-        rank=rank,
-        world_size=world_size,
-    )
-
-    optimizers: List[torch.optim.Optimizer] = [opt1, opt2]
-
-    if optimizer_states:                       # only rank 0 has them
-        assert len(optimizer_states) == len(optimizers)
-        for opt, state in zip(optimizers, optimizer_states):
-            opt.load_state_dict(state)
-            for p,st in opt2.state.items(): st["mantissa"] = st.get("mantissa", torch.zeros_like(p, dtype=torch.uint16)).to(p.device, torch.uint16)
-            for g in opt.param_groups:
-                g["step"] = global_step
-
-    return optimizers
+def build_opts(m: GPT, states: List[dict], step: int) -> List[torch.optim.Optimizer]:
+    mats = sorted([p for p in m.blocks.parameters() if p.ndim >= 2], key=lambda x: x.size(), reverse=True)
+    o1 = torch.optim.AdamW([
+        dict(params=[m.lm_head_w], lr=1/320),
+        dict(params=[*m.embed.parameters(), *m.value_embeds.parameters()], lr=0.3),
+        dict(params=[m.scalars], lr=0.015),
+    ], betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
+    o2 = Muon(mats, lr=0.025, momentum=0.95, rank=rank, world_size=world)
+    if states:
+        for o, s in zip((o1, o2), states):
+            o.load_state_dict(s)
+            if isinstance(o, Muon):
+                for p, st in o.state.items():
+                    st["mantissa"] = st.get("mantissa", torch.zeros_like(p, dtype=torch.uint16)).to(torch.uint16)
+            for g in o.param_groups: g["step"] = step
+    return [o1, o2]
 
 
-# -----------------------------------------------------------------------------
-# Compute descent direction D
-# -----------------------------------------------------------------------------
-
-def _compute_direction(
-    model: GPT,
-    optimizers: List[torch.optim.Optimizer],
-    step: int,
-    rank: int,
-    world_size: int,
-    seed: int,
-) -> List[torch.Tensor]:
-    """Return the optimiser *update* direction D (CPU bf16 tensors)."""
-    # Save starting weights on CPU
-    params_0_cpu = [p.detach().cpu().clone().to(torch.bfloat16) for p in model.parameters()]
-
-    # ---------------- perform one simulated training step (rank 0 only) ----
-    model.train()
-    hp = Hyperparameters()
-    batch_size = world_size * hp.train_seq_len
-    train_iter = distributed_data_generator(
-        hp.train_files,
-        batch_size,
-        rank,
-        world_size,
-        seed=seed,
-    )
-    inp, tgt = next(train_iter)
-    for opt in optimizers:
-        opt.zero_grad(set_to_none=True)
-    loss = model(inp, tgt, get_window_size_blocks(step))
-    loss.backward()
-    for opt in optimizers:
-        opt.step()
-    del inp, tgt, loss
-    torch.cuda.empty_cache()
-
-    # ---------------- build CPU direction list -----------------------------
-    direction_cpu: List[torch.Tensor] = []
-    for p, p0 in zip(model.parameters(), params_0_cpu):
-        diff_cpu = (p.detach().cpu().to(torch.bfloat16) - p0)
-        direction_cpu.append(diff_cpu)
-
-    # restore original weights in‑place
-    for p, p0 in zip(model.parameters(), params_0_cpu):
-        p.data.copy_(p0.to(p.device), non_blocking=True)
-
-    # broadcast D to all ranks (CPU tensors)
-    if world_size > 1:
-        # rank 0 owns the real tensors; others allocate tmp buffers on GPU
-        direction_cuda = (
-            [d.to(device, non_blocking=True) for d in direction_cpu]
-            if rank == 0
-            else [torch.empty_like(p, dtype=torch.bfloat16, device=device)
-                  for p in model.parameters()]
-        )
-        for d in direction_cuda:
-            dist.broadcast(d, src=0)          # NCCL can handle this
-        # non‑0 ranks: bring data back to CPU so D lives off‑device
-        if rank != 0:
-            direction_cpu = [d.cpu() for d in direction_cuda]
-        # free the CUDA buffers on every rank
-        del direction_cuda
-    gc.collect(); torch.cuda.empty_cache()
-    return direction_cpu
+def compute_direction(m: GPT, opt: List[torch.optim.Optimizer], step: int) -> List[torch.Tensor]:
+    w0 = [p.detach().cpu().clone() for p in m.parameters()]
+    batch = ddg(hp.train_files, world * hp.train_seq_len, rank, world, seed=step)
+    inp, tgt = next(batch)
+    [o.zero_grad(set_to_none=True) for o in opt]
+    (m(inp.to(DEV), tgt.to(DEV), wsize(step))).backward(); [o.step() for o in opt]
+    D = [(p.detach().cpu() - w).to(torch.bfloat16) for p, w in zip(m.parameters(), w0)]
+    for p, w in zip(m.parameters(), w0): p.data.copy_(w.to(DEV))  # restore
+    if world > 1:  # broadcast via GPU then back to CPU
+        buf = [d.to(DEV) if rank == 0 else torch.empty_like(p, device=DEV) for d, p in zip(D, m.parameters())]
+        [dist.broadcast(t, 0) for t in buf]
+        D = [t.cpu() for t in buf]
+    gc.collect(); torch.cuda.empty_cache(); return D
 
 
-# -----------------------------------------------------------------------------
-# Apply / rollback helpers (stream CPU -> GPU slice by slice)
-# -----------------------------------------------------------------------------
-
-def _apply_direction(model: GPT, direction: List[torch.Tensor], alpha: float):
-    """In‑place: theta <- theta + alpha * D (slice streaming)."""
-    for p, d_cpu in zip(model.parameters(), direction):
-        d_gpu = d_cpu.to(p.device, dtype=p.dtype, non_blocking=True)
-        p.data.add_(alpha, d_gpu)
-        del d_gpu
-    torch.cuda.empty_cache()
+def apply(m: GPT, D: List[torch.Tensor], a: float):
+    for p, d in zip(m.parameters(), D): p.data.add_(a, d.to(DEV, dtype=p.dtype))
 
 
-# -----------------------------------------------------------------------------
-# Validation evaluation helpers
-# -----------------------------------------------------------------------------
+def val_loss(m: GPT, a: float) -> torch.Tensor:
+    apply(m, m._D, a)
+    v = run_validation(m, m._step, hp, rank, world, seed=1234 + int(a * 1e4)).detach()
+    apply(m, m._D, -a)
+    return v
 
-def evaluate_one_armijo_alpha(
-    alpha: float,
-    model: GPT,
-    rank: int,
-    device: str,
-    world_size: int,
-) -> torch.Tensor:
-    direction = model._direction  # type: ignore[attr-defined]
-    _apply_direction(model, direction, alpha)
-    loss = run_validation(
-        model,
-        model._step,  # type: ignore[attr-defined]
-        Hyperparameters(),
-        rank,
-        world_size,
-        seed=1234 + int(alpha * 1000),
-    ).detach()
-    _apply_direction(model, direction, -alpha)  # rollback
-    return loss
+# ── 1‑D minimisation (Golden‑section) ───────────────────────────────────────
 
+from typing import Dict
 
-def passes_armijo_condition(loss_alpha: torch.Tensor, alpha: float, model: GPT) -> bool:
-    f0 = model._f0  # type: ignore[attr-defined]
-    g0 = model._g0  # type: ignore[attr-defined]
-    return bool(loss_alpha <= f0 + armijo_c1 * alpha * g0)
+def minimise(m: GPT) -> Dict[float, float]:
+    """Golden‑section search that logs every α evaluated instead of just the best one."""
+    phi = (5 ** 0.5 - 1) / 2             # 1/φ
+    losses: Dict[float, float] = {}      # α → val_loss(α)
 
+    def record(alpha: float) -> float:
+        """Cache and return the validation loss at α."""
+        return losses.setdefault(alpha, val_loss(m, alpha))
 
-# -----------------------------------------------------------------------------
-# Main search driver
-# -----------------------------------------------------------------------------
+    # --- bracket the minimiser ------------------------------------------------
+    a, b = 0.0, 4.0
+    fa, fb = record(a), record(b)
+    while fb < fa and b < 128:
+        a, b, fa, fb = b, 2 * b, fb, record(2 * b)
 
-def armijo_search(
-    checkpoint_path: str,
-    rank: int,
-    device: str,
-    world_size: int,
-) -> Tuple[float, float]:
-    """Run Armijo search. Return (best_alpha, best_val_loss)."""
+    # --- golden‑section shrink ------------------------------------------------
+    c, d = b - phi * (b - a), a + phi * (b - a)
+    fc, fd = record(c), record(d)
 
-    # ------------- rank 0 loads checkpoint meta on CPU --------------------
-    if rank == 0:
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        model_state = ckpt.get("model")
-        optim_states = ckpt.get("optimizers", [])
-        step = ckpt.get("step", 0)
-    else:
-        model_state, optim_states, step = None, [], 0
+    while b - a > 1e-3:
+        if fc < fd:        # minimum is in [a,d]
+            b, d, fb, fd = d, c, fd, fc
+            c = b - phi * (b - a)
+            fc = record(c)
+        else:              # minimum is in [c,b]
+            a, c, fa, fc = c, d, fc, fd
+            d = a + phi * (b - a)
+            fd = record(d)
 
-    # broadcast step so everyone knows seed, etc.
-    step_t = torch.tensor([step], dtype=torch.long, device=device)
-    dist.broadcast(step_t, 0)
-    step = int(step_t.item())
-
-    # ------------- build model and load weights ---------------------------
-    model = _build_model(device)
-    model._step = step  # type: ignore[attr-defined]
-
-    if rank == 0 and model_state is not None:
-        load_state_dict_safely(model, model_state, strict=False)
-
-    # broadcast parameters to all ranks
-    for p in model.parameters():
-        dist.broadcast(p.data, 0)
-
-    # ------------- recreate optimisers & compute D ------------------------
-    optimizers = _build_optimizers(model, rank, world_size, optim_states, step)
-    direction = _compute_direction(model, optimizers, step, rank, world_size, seed=step + 1)
-    model._direction = direction  # type: ignore[attr-defined]
-
-    # ------------- baseline val loss + directional derivative -------------
-    model.eval()
-    f0 = run_validation(model, step, Hyperparameters(), rank, world_size, seed=step + 2).detach()
-    eps = 1e-4
-    _apply_direction(model, direction, eps)
-    f_eps = run_validation(model, step, Hyperparameters(), rank, world_size, seed=step + 3).detach()
-    _apply_direction(model, direction, -eps)
-    g0 = (f_eps - f0) / eps
-
-    model._f0 = f0  # type: ignore[attr-defined]
-    model._g0 = g0  # type: ignore[attr-defined]
-
-    if rank == 0:
-        print(f"[Armijo] baseline val_loss={f0.item():.6f}, g0≈{g0.item():.6e}")
-
-    # ------------- back‑tracking loop ------------------------------------
-    alpha = starting_alpha
-    best_alpha, best_loss = 0.0, f0
-
-    while alpha >= min_alpha:
-        loss_alpha = evaluate_one_armijo_alpha(alpha, model, rank, device, world_size)
-        if rank == 0:
-            print(f"[Armijo] alpha={alpha:.6f} -> val_loss={loss_alpha.item():.6f}")
-
-        if loss_alpha < best_loss:
-            best_alpha, best_loss = alpha, loss_alpha
-
-        if passes_armijo_condition(loss_alpha, alpha, model):
-            if rank == 0:
-                print("[Armijo] Armijo condition satisfied — stopping.")
-            break
-
-        alpha *= shrink
-
-    return best_alpha, best_loss.item()
+    return losses  # mapping of every α we tried to its validation loss
 
 
-# -----------------------------------------------------------------------------
-# Simple CLI (checkpoint path currently hard‑coded)
-# -----------------------------------------------------------------------------
+# ── driver ──────────────────────────────────────────────────────────────────
+
+def line_search(ckpt: str) -> Tuple[float, float]:
+    state = torch.load(ckpt, map_location="cpu") if rank == 0 else {}
+    step = state.get("step", 0) if rank == 0 else 0
+    st = torch.tensor([step], device=DEV); dist.broadcast(st, 0); step = int(st)
+    m = build_model(); m._step = step
+    if rank == 0: load_state_dict_safely(m, state["model"], False)
+    [dist.broadcast(p.data, 0) for p in m.parameters()]
+    optim = build_opts(m, state.get("optimizers", []) if rank == 0 else [], step)
+    m._D = compute_direction(m, optim, step); m.eval()
+    return minimise(m)
 
 if __name__ == "__main__":
-    checkpoint = "/home/paperspace/dev/modded-nanogpt/logs/gptm_record/state_step000125.pt"
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", rank=0, world_size=1)
-    best_alpha, best_loss = armijo_search(
-        checkpoint_path=checkpoint,
-        rank=rank,
-        device="cuda",
-        world_size=8,
-    )
-
-    print(f"Chosen alpha={best_alpha:.6f}, validation loss={best_loss:.6f}")
-
+    # dfs = []
+    # for step in range(0, 4001, 1000):
+    #     alphas_to_losses = line_search(f"/home/paperspace/dev/modded-nanogpt/logs/gptm_record/state_step{step:06d}.pt")
+    #     if rank == 0:
+    #         for alpha, loss in alphas_to_losses.items():
+    #             print(f"Alpha: {alpha}, Loss: {loss}")
+    #     df = pd.DataFrame(alphas_to_losses.items(), columns=["alpha", "loss"])
+    #     df["step"] = step
+    #     df['loss'] = df['loss'].apply(lambda x: float(x))
+    #     dfs.append(df)
+    # df = pd.concat(dfs)
+    # df.to_csv("armijo.csv", index=False)
     dist.destroy_process_group()
+
+    df = pd.read_csv("armijo.csv")
+    # for each step, find the minimizing alpha (called alpha^*) and corresponding loss
+    # then plot alpha^* vs. val_loss
+    grouped = df.groupby("step")
+    minimized_df = grouped.apply(lambda x: x[x["loss"] == x["loss"].min()])
+    plt.scatter(minimized_df["loss"], minimized_df["alpha"])
+    plt.savefig("armijo_scatter.png")
+
+    # Create a figure and axis
+    fig, ax = plt.subplots()
+
+    # Create a function to update the plot for each frame
+    def update(frame):
+        ax.clear()
+        ax.scatter(df[df["step"] == frame]["alpha"], df[df["step"] == frame]["loss"])
+        ax.set_title(f"Step {frame}")
+    
+    # Create the animation
+    ani = animation.FuncAnimation(fig, update, frames=df["step"].unique(), repeat=False)
+    
+    # Save the animation as a GIF
+    ani.save("armijo.gif", writer="pillow")
+    
+    

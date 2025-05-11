@@ -482,9 +482,10 @@ if __name__ == "__main__":
     device = "cuda"
 
     # Configure paths
-    record_names = ["gptm_adam", "gptm_record"]
-    starting_minibatch_steps = [125, 4000, 2000]
-    forward_iteration_values = [200, 100, 50, 20, 10, 1]
+    record_names = ["muon_record"]
+    starting_minibatch_steps = [0, 5, 10, 25, 125, 2000, 4000]
+    forward_iteration_values = [1, 10, 100]
+    batch_size_factors = [1.0, 0.5, 0.125, 0.0625]
     margin = 0.2
     grid_size = 10
     
@@ -501,32 +502,32 @@ if __name__ == "__main__":
             print(f"Starting data collection for {record_name}, step {step}, forward {forward_iterations}")
         
         output_csv_path = f"souping_data/{record_name}_step{step}_forward{forward_iterations}.csv"
-        # if not os.path.exists(output_csv_path):
-        #     print(f"Calculating loss landscape for {record_name}, step {step}, forward {forward_iterations}")
-        #     # Calculate loss landscape
-        #     df = calculate_loss_landscape(
-        #         record_name=record_name,
-        #         step=step,
-        #         forward_iterations=forward_iterations,
-        #         early_path=early_path,
-        #         late_path1=late_path1,
-        #         late_path2=late_path2,
-        #         grid_size=grid_size,
-        #         world_size=world_size,
-        #         rank=rank,
-        #         device=device,
-        #         margin=margin
-        #     )
+        if not os.path.exists(output_csv_path):
+            print(f"Calculating loss landscape for {record_name}, step {step}, forward {forward_iterations}")
+            # Calculate loss landscape
+            df = calculate_loss_landscape(
+                record_name=record_name,
+                step=step,
+                forward_iterations=forward_iterations,
+                early_path=early_path,
+                late_path1=late_path1,
+                late_path2=late_path2,
+                grid_size=grid_size,
+                world_size=world_size,
+                rank=rank,
+                device=device,
+                margin=margin
+            )
         
-        #     # Save to list if on rank 0
-        #     if rank == 0:
-        #         all_dataframes.append(df)
+            # Save to list if on rank 0
+            if rank == 0:
+                all_dataframes.append(df)
                 
-        #         # Also save individual dataframe
-        #         os.makedirs("souping_data", exist_ok=True)
-        #         df.to_csv(output_csv_path, index=False)
-        # else:
-            # print(f"Skipping {record_name}, step {step}, forward {forward_iterations} because it already exists")
+                # Also save individual dataframe
+                os.makedirs("souping_data", exist_ok=True)
+                df.to_csv(output_csv_path, index=False)
+        else:
+            print(f"Skipping {record_name}, step {step}, forward {forward_iterations} because it already exists")
     
     for record in ["gptm_adam", "gptm_record"]:
         dfs = [pd.read_csv(f"souping_data/{f}") for f in os.listdir("souping_data") if f.endswith('.csv') and record in f]

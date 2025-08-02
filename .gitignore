@@ -1,4 +1,13 @@
+gradient_logs
+sv_evolution_frames
 fineweb10B/
 pylog124M/
 __pycache__/
 logs/
+archive
+logs
+model_checkpoints
+nanogpt-venv
+data
+img
+

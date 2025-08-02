@@ -2,3 +2,10 @@ fineweb10B/
 pylog124M/
 __pycache__/
 logs/
+nanogpt-venv
+accumulated_visualizations
+visualizations
+matrices
+polynomial_logs
+checkpoints
+wandb
